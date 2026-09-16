@@ -1,9 +1,12 @@
 /**
- * EVLT Broadcast Push — Vercel serverless function
+ * EVLT Broadcast Push — Vercel serverless function (v2)
  * -----------------------------------------------------------------
- * Sends a Firebase Cloud Messaging push to a list of device tokens.
- * The Firebase service-account credential lives only in Vercel
- * environment variables — never in code, never in the client.
+ * Sends a Firebase Cloud Messaging push to every registered device.
+ * Unlike the first version, THIS function fetches the token list
+ * itself (server-side, using admin credentials that bypass your
+ * database security rules) rather than trusting the browser to read
+ * and forward it — the browser correctly can't read the full
+ * push_tokens list, which is why the previous version never fired.
  *
  * REQUIRED ENVIRONMENT VARIABLES (Vercel dashboard -> your project
  * -> Settings -> Environment Variables -> Add, for "Production"):
@@ -15,20 +18,33 @@
  *                                Must match BROADCAST_SECRET_CLIENT
  *                                in index.html
  *
- * Deployed URL will look like:
- *   https://<your-project>.vercel.app/api/send-broadcast
+ * After changing either variable, redeploy (Deployments tab -> "..."
+ * on latest -> Redeploy) so the function picks up the new value.
  *
  * Request format expected from the app:
  *   POST /api/send-broadcast
- *   { "secret": "...", "title": "...", "body": "...", "tokens": ["...", ...] }
+ *   { "secret": "...", "title": "...", "body": "..." }
+ *   (no "tokens" needed anymore — the server looks them up itself)
  *
  * Response:
- *   { "sent": <n>, "failed": <n>, "invalidTokens": ["...", ...] }
+ *   { "sent": <n>, "failed": <n>, "removedInvalidTokens": <n> }
  */
 
-const jwt = require("jsonwebtoken");
+const admin = require("firebase-admin");
 
-const PROJECT_ID = "evlt-admin";
+const DATABASE_URL = "https://evlt-admin-default-rtdb.europe-west1.firebasedatabase.app";
+
+let appInitialized = false;
+
+function ensureAdminApp() {
+  if (appInitialized) return;
+  const serviceAccount = JSON.parse(process.env.FCM_SERVICE_ACCOUNT_JSON);
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL: DATABASE_URL,
+  });
+  appInitialized = true;
+}
 
 module.exports = async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -38,105 +54,84 @@ module.exports = async (req, res) => {
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-  const { secret, title, body, tokens } = req.body || {};
+  const { secret, title, body } = req.body || {};
 
   if (!process.env.BROADCAST_SECRET || secret !== process.env.BROADCAST_SECRET) {
     return res.status(401).json({ error: "Unauthorized" });
   }
-  if (!title || !Array.isArray(tokens) || tokens.length === 0) {
-    return res.status(400).json({ error: "Missing title or tokens" });
+  if (!title) {
+    return res.status(400).json({ error: "Missing title" });
   }
 
-  let serviceAccount;
   try {
-    serviceAccount = JSON.parse(process.env.FCM_SERVICE_ACCOUNT_JSON);
+    ensureAdminApp();
   } catch (e) {
     return res.status(500).json({ error: "Server misconfigured: bad service account env var" });
   }
 
-  let accessToken;
+  let tokensSnapshot;
   try {
-    accessToken = await getGoogleAccessToken(serviceAccount);
+    tokensSnapshot = await admin.database().ref("push_tokens").once("value");
   } catch (e) {
-    return res.status(500).json({ error: "Failed to authenticate with Google: " + e.message });
+    return res.status(500).json({ error: "Failed to read push_tokens from database: " + e.message });
+  }
+
+  const tokensObj = tokensSnapshot.val() || {};
+  const entries = Object.entries(tokensObj); // [ [dbKey, {token, user, ...}], ... ]
+  const tokens = entries.map(([, v]) => v && v.token).filter(Boolean);
+
+  if (tokens.length === 0) {
+    return res.status(200).json({ sent: 0, failed: 0, removedInvalidTokens: 0, note: "No registered tokens found." });
   }
 
   let sent = 0;
   let failed = 0;
-  const invalidTokens = [];
+  const dbKeysToRemove = [];
 
-  const BATCH_SIZE = 25;
+  // sendEachForMulticast handles up to 500 tokens per call.
+  const BATCH_SIZE = 500;
   for (let i = 0; i < tokens.length; i += BATCH_SIZE) {
-    const batch = tokens.slice(i, i + BATCH_SIZE);
-    const results = await Promise.all(batch.map((t) => sendOne(accessToken, t, title, body)));
-    results.forEach((r, idx) => {
-      if (r.ok) {
+    const batchTokens = tokens.slice(i, i + BATCH_SIZE);
+    const batchEntries = entries.slice(i, i + BATCH_SIZE);
+
+    let response;
+    try {
+      response = await admin.messaging().sendEachForMulticast({
+        tokens: batchTokens,
+        notification: { title, body: body || "" },
+        webpush: { notification: { icon: "/apple-touch-icon.png" } },
+      });
+    } catch (e) {
+      failed += batchTokens.length;
+      continue;
+    }
+
+    response.responses.forEach((r, idx) => {
+      if (r.success) {
         sent++;
       } else {
         failed++;
-        if (r.invalid) invalidTokens.push(batch[idx]);
+        const code = r.error && r.error.code;
+        if (
+          code === "messaging/registration-token-not-registered" ||
+          code === "messaging/invalid-registration-token" ||
+          code === "messaging/invalid-argument"
+        ) {
+          dbKeysToRemove.push(batchEntries[idx][0]);
+        }
       }
     });
   }
 
-  return res.status(200).json({ sent, failed, invalidTokens });
-};
-
-async function sendOne(accessToken, token, title, body) {
-  const resp = await fetch(`https://fcm.googleapis.com/v1/projects/${PROJECT_ID}/messages:send`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      message: {
-        token,
-        notification: { title, body: body || "" },
-        webpush: { notification: { icon: "/apple-touch-icon.png" } },
-      },
-    }),
-  });
-
-  if (resp.ok) return { ok: true };
-
-  const errText = await resp.text().catch(() => "");
-  const invalid =
-    errText.includes("UNREGISTERED") ||
-    errText.includes("NOT_FOUND") ||
-    errText.includes("INVALID_ARGUMENT");
-  return { ok: false, invalid };
-}
-
-async function getGoogleAccessToken(serviceAccount) {
-  const now = Math.floor(Date.now() / 1000);
-
-  const assertion = jwt.sign(
-    {
-      iss: serviceAccount.client_email,
-      scope: "https://www.googleapis.com/auth/firebase.messaging",
-      aud: serviceAccount.token_uri,
-      iat: now,
-      exp: now + 3600,
-    },
-    serviceAccount.private_key,
-    { algorithm: "RS256" }
-  );
-
-  const tokenRes = await fetch(serviceAccount.token_uri, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-      assertion,
-    }),
-  });
-
-  if (!tokenRes.ok) {
-    const errText = await tokenRes.text().catch(() => "");
-    throw new Error("Token exchange failed: " + errText);
+  if (dbKeysToRemove.length) {
+    const updates = {};
+    dbKeysToRemove.forEach((key) => (updates[key] = null));
+    try {
+      await admin.database().ref("push_tokens").update(updates);
+    } catch (e) {
+      // Non-fatal: stale tokens will just be retried (and fail again) next time.
+    }
   }
 
-  const data = await tokenRes.json();
-  return data.access_token;
-}
+  return res.status(200).json({ sent, failed, removedInvalidTokens: dbKeysToRemove.length });
+};
