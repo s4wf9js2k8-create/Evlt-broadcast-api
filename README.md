@@ -14,7 +14,7 @@ The endpoint rejects requests if the origin or administrator allowlist is missin
 
 ## Firebase setup
 
-In Firebase Console for `evlt-admin`, enable the Google sign-in provider under Authentication. Add the dashboard's hosting domains to Authorized domains. The administrator must use a verified Google account whose email appears in `BROADCAST_ALLOWED_EMAILS`.
+In Firebase Console for `evlt-admin`, enable the Google sign-in provider under Authentication. Add the dashboard's hosting domains to Authorized domains. The administrator must use a verified Google account whose email exactly matches `BROADCAST_ADMIN_EMAIL`.
 
 ## Deploying
 
