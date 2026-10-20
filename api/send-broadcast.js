@@ -5,7 +5,7 @@
  *
  * Required Vercel environment variables:
  *   FCM_SERVICE_ACCOUNT_JSON   Firebase service-account JSON
- *   BROADCAST_ALLOWED_EMAILS  Comma-separated, verified admin email addresses
+ *   BROADCAST_ADMIN_EMAIL  Comma-separated, verified admin email addresses
  *   ALLOWED_ORIGINS            Comma-separated exact dashboard origins
  */
 
@@ -64,8 +64,8 @@ module.exports = async (req, res) => {
   if (!title || title.length > 120) return res.status(400).json({ error: "Title must be between 1 and 120 characters" });
   if (message.length > 2000) return res.status(400).json({ error: "Message must be 2000 characters or fewer" });
 
-  const allowedEmails = new Set(Array.from(csvSet(process.env.BROADCAST_ALLOWED_EMAILS), (email) => email.toLowerCase()));
-  if (allowedEmails.size === 0) return res.status(503).json({ error: "Broadcast access is not configured" });
+  const adminEmail = String(process.env.BROADCAST_ADMIN_EMAIL || "").trim().toLowerCase();
+  if (!adminEmail || adminEmail.includes(",")) return res.status(503).json({ error: "Broadcast access is not configured" });
 
   const authorization = req.headers && req.headers.authorization;
   const match = typeof authorization === "string" && authorization.match(/^Bearer\s+(.+)$/i);
@@ -80,7 +80,7 @@ module.exports = async (req, res) => {
       !decoded.email_verified ||
       !email ||
       signInProvider === "anonymous" ||
-      !allowedEmails.has(email)
+      email !== adminEmail
     ) {
       return res.status(403).json({ error: "This account is not allowed to send broadcasts" });
     }
